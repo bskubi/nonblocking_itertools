@@ -1,112 +1,102 @@
-import itertools
-from dataclasses import dataclass
 from threading import Thread
-import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import *
-
-def generate_laggy(values, lag=1):
-    for v in values:
-        time.sleep(lag)
-        yield v
-
-class NonblockingStreams:
-    def __init__(self, *iterators):
-        self.iterators = iterators
-
-        self.collected = {i: [] for i in range(len(self.iterators))}
-        self.returned_count = {i: 0 for i in range(len(self.iterators))}
-        self.stop_iteration = {i: False for i in range(len(self.iterators))}
-        self.threads = [Thread(target=self.collect, args=[i]) for i in range(len(self.iterators))]
-        [thread.start() for thread in self.threads]
-
-    def collect(self, i):
-        self.collected[i] = []
-        self.returned_count[i] = 0
-        self.stop_iteration[i] = False
-        
-        for it in self.iterators[i]:
-            self.collected[i].append(it)
-
-        self.stop_iteration[i] = True
-    
-    def get(self, i = None, timeout: int | None = None):
-
-        if i == None:
-            I = list(range(len(self.iterators)))
-        elif isinstance(i, int):
-            I = [i]
-        else:
-            I = i
-
-        
-        result = None
-        start = time.time() * 1000
-
-        while not result and (not timeout or time.time() * 1000 - start < timeout):
-            for i in I:
-                if self.returned_count[i] < len(self.collected[i]):
-                    returned = self.returned_count[i]
-                    collected = self.collected[i][returned]
-                    result = (i, collected)
-                    break
-    
-        if not result:
-            raise TimeoutError
-
-        self.returned_count[i] += 1
-        return result
-    
-    def returned(self, which: int | List[int] | None = None):
-        which = range(len(self.iterators)) if which is None else which
-        which = [which] if isinstance(which, int) else which
-        result = {}
-        for i in which:
-            result[i] = self.collected[i][:self.returned_count[i]]
-        return result
-
-    def all_returned(self, check=None):
-        check = range(len(self.iterators)) if check is None else check
-        check = [check] if isinstance(check, int) else check
-        return all([self.returned_count[i] == len(self.collected[i]) and self.stop_iteration[i] for i in check])
-
-def product(*iterables: Iterable):
-    streams = NonblockingStreams(*iterables)
-    while not streams.all_returned():
-        i, n = streams.get(timeout=None)
-        returned = streams.returned()
-        returned[i] = [n]
-
-        yield from itertools.chain(itertools.product(*list(returned.values())))
-
+from dataclasses import dataclass, field
+from collections import deque
+import time
+import itertools
+from functools import partial
+from salish import *
 
 def combinations(iterable: Iterable, r: int):
-    streams = NonblockingStreams(iterable)
-    while not streams.all_returned():
-        i, n = streams.get(timeout=None)
-        returned = streams.returned()[0][:-1]
-        for c in itertools.combinations(returned, r-1):
-            yield tuple([*c, n])
+    channel = Channel(iterable)
+    for i, n in enumerate(channel):
+        collected = channel.collected[:i]
+        combinations = itertools.combinations(collected, r-1)
+        for combination in combinations:
+            yield tuple([*combination, n])
 
 def combinations_with_replacement(iterable: Iterable, r: int):
-    streams = NonblockingStreams(iterable)
-    while not streams.all_returned():
-        _, n = streams.get(timeout=None)
-        returned = streams.returned()[0][:-1]
+    channel = Channel(iterable)
+    for i, n in enumerate(channel):
         for _r in range(0, r):
-            for c in itertools.combinations_with_replacement(returned, _r):
-                yield tuple([*c, *[n]*(r-_r)])
+            collected = channel.collected[:i]
+            combinations = itertools.combinations_with_replacement(collected, _r)
+            for combination in combinations:
+                repeat = (r - _r)
+                repeated = [n]*repeat
+                yield tuple([*combination, *repeated])
 
-def permutations(iterable: Iterable, r=None):
-    streams = NonblockingStreams(iterable)
-    while not streams.all_returned():
-        _, n = streams.get(timeout=None)
-        returned = streams.returned()[0][:-1]
-        for c in itertools.combinations(returned, r-1):
-            yield from itertools.permutations([*c, n], r)
+def permutations(iterable: Iterable, r = None):
+    channel = Channel(iterable)
+    for i, n in enumerate(channel):
+        collected = channel.collected[:i]
+        combinations = itertools.combinations(collected, r - 1)
+        for combinations in combinations:
+            yield from itertools.permutations([*combinations, n], r)
+
+def product(*iterables: List[Iterable]):
+    @dataclass
+    class Collection:
+        count: int
+        iterables_count: int
+        collection = {}
+        complete = 0
+        generators = []
+
+        def __post_init__(self):
+            self.iterables_count = self.count
+
+        def collect(self, value, i):
+            self.collection.setdefault(i, [])
+            self.collection[i].append(value)
+            if len(self.collection) == self.iterables_count:
+                iterables = list(self.collection.values())
+                iterables[i] = [value]
+                self.generators.append(itertools.product(*iterables))
+        
+        def stop_iteration(self):
+            self.count -= 1
+        
+        def items(self):
+            while not self.complete and not self.generators:
+                time.sleep(.01)
+            if not self.complete and self.generators:
+                yield from itertools.chain(*self.generators)
+
+
+
+    collection = Collection(len(iterables), len(iterables))
+    channels = [Channel(it).bind(partial(collection.collect, i=i), collection.stop_iteration) for i, it in enumerate(iterables)]
+    yield from collection.items()
 
 def chain(*iterables: List[Iterable]):
-    streams = NonblockingStreams(*iterables)
-    for i in range(len(iterables)):
-        while not streams.all_returned(i):
-            _, n = streams.get(i)
-            yield n
+    channels = [Channel(it) for it in iterables]
+    yield from itertools.chain.from_iterable(channels)
+
+def roundrobin(*iterables: List[Iterable]):
+    @dataclass
+    class Collection:
+        count: int
+        collection: List[Any] = field(default_factory = list)
+        index = 0
+
+        def collect(self, item):
+            self.collection.append(item)
+        
+        def stop_iteration(self):
+            self.count -= 1
+
+        def __iter__(self):
+            while self.count > 0 or self.index < len(self.collection):
+                while self.index >= len(self.collection) and self.count > 0:
+                    continue
+                if self.index < len(self.collection):
+                    result = self.collection[self.index]
+                    self.index += 1
+                    yield result
+
+
+    collection = Collection(len(iterables))
+    [Channel(it).bind(collection.collect, collection.stop_iteration) for it in iterables]
+    yield from collection
